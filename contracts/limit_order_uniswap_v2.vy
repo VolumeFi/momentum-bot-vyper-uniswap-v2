@@ -53,6 +53,10 @@ event UpdateFee:
 event SetPaloma:
     paloma: bytes32
 
+event UpdateServiceFeeCollector:
+    old_service_fee_collector: address
+    new_service_fee_collector: address
+
 WETH: immutable(address)
 VETH: constant(address) = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE # Virtual ETH
 MAX_SIZE: constant(uint256) = 8
@@ -63,17 +67,20 @@ deposits: public(HashMap[uint256, Deposit])
 refund_wallet: public(address)
 fee: public(uint256)
 paloma: public(bytes32)
+service_fee_collector: public(address)
 
 @external
-def __init__(_compass: address, router: address, _refund_wallet: address, _fee: uint256):
+def __init__(_compass: address, router: address, _refund_wallet: address, _fee: uint256,  _service_fee_collector: address):
     self.compass = _compass
     ROUTER = router
     WETH = UniswapV2Router(ROUTER).WETH()
     self.refund_wallet = _refund_wallet
     self.fee = _fee
+    self.service_fee_collector = _service_fee_collector
     log UpdateCompass(empty(address), _compass)
     log UpdateRefundWallet(empty(address), _refund_wallet)
     log UpdateFee(0, _fee)
+    log UpdateServiceFeeCollector(empty(address), _service_fee_collector)
 
 @internal
 def _safe_approve(_token: address, _to: address, _value: uint256):
@@ -84,6 +91,16 @@ def _safe_approve(_token: address, _to: address, _value: uint256):
     )  # dev: failed approve
     if len(_response) > 0:
         assert convert(_response, bool) # dev: failed approve
+
+@internal
+def _safe_transfer(_token: address, _to: address, _value: uint256):
+    _response: Bytes[32] = raw_call(
+        _token,
+        _abi_encode(_to, _value, method_id=method_id("transfer(address,uint256)")),
+        max_outsize=32
+    )  # dev: failed transfer
+    if len(_response) > 0:
+        assert convert(_response, bool) # dev: failed transfer
 
 @internal
 def _safe_transfer_from(_token: address, _from: address, _to: address, _value: uint256):
@@ -161,14 +178,21 @@ def _withdraw(deposit_id: uint256, min_amount0: uint256, withdraw_type: Withdraw
         path[last_index] = WETH
     self._safe_approve(path[0], ROUTER, deposit.amount1)
     _amount0: uint256 = 0
+    actual_amount: uint256 = 0
     if deposit.path[0] == VETH:
-        _amount0 = deposit.depositor.balance
-        UniswapV2Router(ROUTER).swapExactTokensForETHSupportingFeeOnTransferTokens(deposit.amount1, min_amount0, path, deposit.depositor, block.timestamp)
-        _amount0 = deposit.depositor.balance - _amount0
+        _amount0 = self.balance
+        UniswapV2Router(ROUTER).swapExactTokensForETHSupportingFeeOnTransferTokens(deposit.amount1, min_amount0, path, self, block.timestamp)
+        _amount0 = self.balance - _amount0
+        actual_amount = unsafe_div(_amount0 * 995, 1000)
+        send(deposit.depositor, actual_amount)
+        send(self.service_fee_collector, unsafe_sub(_amount0, actual_amount))
     else:
         _amount0 = ERC20(path[last_index]).balanceOf(self)
-        UniswapV2Router(ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(deposit.amount1, min_amount0, path, deposit.depositor, block.timestamp)
+        UniswapV2Router(ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(deposit.amount1, min_amount0, path, self, block.timestamp)
         _amount0 = ERC20(path[last_index]).balanceOf(self) - _amount0
+        actual_amount = unsafe_div(_amount0 * 995, 1000)
+        self._safe_transfer(deposit.path[0], deposit.depositor, actual_amount)
+        self._safe_transfer(deposit.path[0], self.service_fee_collector, unsafe_sub(_amount0, actual_amount))
     log Withdrawn(deposit_id, msg.sender, withdraw_type, _amount0)
     return _amount0
 
@@ -215,3 +239,14 @@ def set_paloma():
     _paloma: bytes32 = convert(slice(msg.data, 4, 32), bytes32)
     self.paloma = _paloma
     log SetPaloma(_paloma)
+
+@external
+def update_service_fee_collector(new_service_fee_collector: address):
+    assert msg.sender == self.service_fee_collector, "Unauthorized"
+    self.service_fee_collector = new_service_fee_collector
+    log UpdateServiceFeeCollector(msg.sender, new_service_fee_collector)
+
+@external
+@payable
+def __default__():
+    assert msg.sender == ROUTER
