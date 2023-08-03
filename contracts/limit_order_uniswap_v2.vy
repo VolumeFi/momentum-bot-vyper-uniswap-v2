@@ -197,10 +197,12 @@ def _withdraw(deposit_id: uint256, min_amount0: uint256, withdraw_type: Withdraw
     return _amount0
 
 @external
+@nonreentrant('lock')
 def cancel(deposit_id: uint256, min_amount0: uint256) -> uint256:
     return self._withdraw(deposit_id, min_amount0, WithdrawType.CANCEL)
 
 @external
+@nonreentrant('lock')
 def multiple_withdraw(deposit_ids: DynArray[uint256, MAX_SIZE], min_amounts0: DynArray[uint256, MAX_SIZE], withdraw_types: DynArray[WithdrawType, MAX_SIZE]):
     assert msg.sender == self.compass, "Unauthorized"
     _len: uint256 = len(deposit_ids)
