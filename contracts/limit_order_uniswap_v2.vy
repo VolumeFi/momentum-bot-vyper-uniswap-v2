@@ -57,9 +57,14 @@ event UpdateServiceFeeCollector:
     old_service_fee_collector: address
     new_service_fee_collector: address
 
+event UpdateServiceFee:
+    old_service_fee: uint256
+    new_service_fee: uint256
+
 WETH: immutable(address)
 VETH: constant(address) = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE # Virtual ETH
 MAX_SIZE: constant(uint256) = 8
+DENOMINATOR: constant(uint256) = 10000
 ROUTER: immutable(address)
 compass: public(address)
 deposit_size: public(uint256)
@@ -68,19 +73,22 @@ refund_wallet: public(address)
 fee: public(uint256)
 paloma: public(bytes32)
 service_fee_collector: public(address)
+service_fee: public(uint256)
 
 @external
-def __init__(_compass: address, router: address, _refund_wallet: address, _fee: uint256,  _service_fee_collector: address):
+def __init__(_compass: address, router: address, _refund_wallet: address, _fee: uint256,  _service_fee_collector: address, _service_fee: uint256):
     self.compass = _compass
     ROUTER = router
     WETH = UniswapV2Router(ROUTER).WETH()
     self.refund_wallet = _refund_wallet
     self.fee = _fee
     self.service_fee_collector = _service_fee_collector
+    self.service_fee = _service_fee
     log UpdateCompass(empty(address), _compass)
     log UpdateRefundWallet(empty(address), _refund_wallet)
     log UpdateFee(0, _fee)
     log UpdateServiceFeeCollector(empty(address), _service_fee_collector)
+    log UpdateServiceFee(0, _service_fee)
 
 @internal
 def _safe_approve(_token: address, _to: address, _value: uint256):
@@ -117,11 +125,12 @@ def _safe_transfer_from(_token: address, _from: address, _to: address, _value: u
 @nonreentrant("lock")
 def deposit(path: DynArray[address, MAX_SIZE], amount0: uint256, min_amount1: uint256, profit_taking: uint256, stop_loss: uint256):
     _value: uint256 = msg.value
-    _fee: uint256 = self.fee
-    assert _value >= _fee, "Insufficient fee"
     assert self.paloma != empty(bytes32), "Paloma not set"
-    send(self.refund_wallet, _fee)
-    _value = unsafe_sub(_value, _fee)
+    _fee: uint256 = self.fee
+    if _fee > 0:
+        assert _value >= _fee, "Insufficient fee"
+        send(self.refund_wallet, _fee)
+        _value = unsafe_sub(_value, _fee)
     assert len(path) >= 2, "Wrong path"
     _path: DynArray[address, MAX_SIZE] = path
     token0: address = path[0]
@@ -135,7 +144,8 @@ def deposit(path: DynArray[address, MAX_SIZE], amount0: uint256, min_amount1: ui
         WrappedEth(WETH).deposit(value=amount0)
         _path[0] = WETH
     else:
-        send(msg.sender, _value)
+        if _value > 0:
+            send(msg.sender, _value)
         _amount0 = ERC20(token0).balanceOf(self)
         self._safe_transfer_from(token0, msg.sender, self, amount0)
         _amount0 = ERC20(token0).balanceOf(self) - _amount0
@@ -178,21 +188,29 @@ def _withdraw(deposit_id: uint256, min_amount0: uint256, withdraw_type: Withdraw
         path[last_index] = WETH
     self._safe_approve(path[0], ROUTER, deposit.amount1)
     _amount0: uint256 = 0
+    service_fee_amount: uint256 = 0
+    _service_fee: uint256 = self.service_fee
     actual_amount: uint256 = 0
     if deposit.path[0] == VETH:
         _amount0 = self.balance
         UniswapV2Router(ROUTER).swapExactTokensForETHSupportingFeeOnTransferTokens(deposit.amount1, min_amount0, path, self, block.timestamp)
         _amount0 = self.balance - _amount0
-        actual_amount = unsafe_div(_amount0 * 995, 1000)
+        if _service_fee > 0:
+            service_fee_amount = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
+        actual_amount = unsafe_sub(_amount0, service_fee_amount)
         send(deposit.depositor, actual_amount)
-        send(self.service_fee_collector, unsafe_sub(_amount0, actual_amount))
+        if service_fee_amount > 0:
+            send(self.service_fee_collector, service_fee_amount)
     else:
         _amount0 = ERC20(path[last_index]).balanceOf(self)
         UniswapV2Router(ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(deposit.amount1, min_amount0, path, self, block.timestamp)
         _amount0 = ERC20(path[last_index]).balanceOf(self) - _amount0
-        actual_amount = unsafe_div(_amount0 * 995, 1000)
+        if _service_fee > 0:
+            service_fee_amount = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
+        actual_amount = unsafe_sub(_amount0, service_fee_amount)
         self._safe_transfer(deposit.path[0], deposit.depositor, actual_amount)
-        self._safe_transfer(deposit.path[0], self.service_fee_collector, unsafe_sub(_amount0, actual_amount))
+        if service_fee_amount > 0:
+            self._safe_transfer(deposit.path[0], self.service_fee_collector, service_fee_amount)
     log Withdrawn(deposit_id, msg.sender, withdraw_type, _amount0)
     return _amount0
 
@@ -249,6 +267,14 @@ def update_service_fee_collector(new_service_fee_collector: address):
     log UpdateServiceFeeCollector(msg.sender, new_service_fee_collector)
 
 @external
+def update_service_fee(new_service_fee: uint256):
+    assert msg.sender == self.compass and len(msg.data) == 68 and convert(slice(msg.data, 36, 32), bytes32) == self.paloma, "Unauthorized"
+    assert new_service_fee < DENOMINATOR
+    old_service_fee: uint256 = self.service_fee
+    self.service_fee = new_service_fee
+    log UpdateServiceFee(old_service_fee, new_service_fee)
+
+@external
 @payable
 def __default__():
-    assert msg.sender == ROUTER
+    pass
